@@ -4,6 +4,8 @@
 **Email:** fofadiyadarshan@gmail.com  
 **Date:** December 2, 2025
 
+Read the [arxiv](https://arxiv.org/abs/2512.03343) paper here
+
 ## Abstract
 
 Autoregressive Language Models (LLMs) trained on Next-Token Prediction (NTP) often suffer from "Topic Drift" where the generation wanders away from the initial prompt due to a reliance on local associations rather than global planning [Holtzman et al., 2020]. While scaling model size mitigates this [Brown et al., 2020], the fundamental myopia of the NTP objective remains.
