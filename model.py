@@ -1,126 +1,103 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+from peft import get_peft_model, LoraConfig, TaskType, prepare_model_for_kbit_training
 
-class CausalSelfAttention(nn.Module):
-    def __init__(self, config):
+class IdeaGatedModel(nn.Module):
+    def __init__(self, model_name, device, alpha_max=0.5):
         super().__init__()
-        self.c_attn = nn.Linear(config['n_embd'], 3 * config['n_embd'])
-        self.c_proj = nn.Linear(config['n_embd'], config['n_embd'])
-        self.n_head = config['n_head']
-        self.n_embd = config['n_embd']
-        self.register_buffer("bias", torch.tril(torch.ones(config['block_size'], config['block_size']))
-                                     .view(1, 1, config['block_size'], config['block_size']))
+        self.device = device
+        self.alpha_max = alpha_max
+        self.beta_clamp = -2.0 # From paper Eq (5)
 
-    def forward(self, x):
-        B, T, C = x.size()
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / (k.size(-1)**0.5))
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-        y = att @ v
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
-        return self.c_proj(y)
-
-class MLP(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.c_fc    = nn.Linear(config['n_embd'], 4 * config['n_embd'])
-        self.gelu    = nn.GELU()
-        self.c_proj  = nn.Linear(4 * config['n_embd'], config['n_embd'])
-    def forward(self, x):
-        return self.c_proj(self.gelu(self.c_fc(x)))
-
-class Block(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.ln_1 = nn.LayerNorm(config['n_embd'])
-        self.attn = CausalSelfAttention(config)
-        self.ln_2 = nn.LayerNorm(config['n_embd'])
-        self.mlp = MLP(config)
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
-        return x
-
-# --- BASELINE MODEL ---
-class StandardTransformer(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config['vocab_size'], config['n_embd']),
-            wpe = nn.Embedding(config['block_size'], config['n_embd']),
-            drop = nn.Dropout(config['dropout']),
-            h = nn.ModuleList([Block(config) for _ in range(config['n_layer'])]),
-            ln_f = nn.LayerNorm(config['n_embd']),
-        ))
-        self.lm_head = nn.Linear(config['n_embd'], config['vocab_size'], bias=False)
-        self.lm_head.weight = self.transformer.wte.weight
-        self.apply(self._init_weights)
-
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-
-    def forward(self, idx):
-        device = idx.device
-        b, t = idx.size()
-        pos = torch.arange(0, t, dtype=torch.long, device=device)
-        x = self.transformer.drop(self.transformer.wte(idx) + self.transformer.wpe(pos))
-        for block in self.transformer.h: x = block(x)
-        x = self.transformer.ln_f(x)
-        return self.lm_head(x)
-
-# --- IDEA-GATED MODEL ---
-class IdeaGatedTransformer(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config['vocab_size'], config['n_embd']),
-            wpe = nn.Embedding(config['block_size'], config['n_embd']),
-            drop = nn.Dropout(config['dropout']),
-            h = nn.ModuleList([Block(config) for _ in range(config['n_layer'])]),
-            ln_f = nn.LayerNorm(config['n_embd']),
-        ))
-        self.token_head = nn.Linear(config['n_embd'], config['vocab_size'], bias=False)
-        self.token_head.weight = self.transformer.wte.weight
+        print(f"Loading Base Model: {model_name}...")
         
-        self.idea_head_mlp = nn.Sequential(
-            nn.Linear(config['n_embd'], config['n_embd']),
-            nn.ReLU(),
-            nn.Linear(config['n_embd'], config['vocab_size'])
+        # 1. Quantization Config (Crucial for g5.xlarge VRAM)
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16, # Compute in bf16
+            bnb_4bit_use_double_quant=True,
         )
-        self.apply(self._init_weights)
 
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        # 2. Load Base Model
+        self.base_model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            quantization_config=bnb_config,
+            device_map={"": 0}, # Force to primary GPU
+            trust_remote_code=True
+        )
+        
+        # Prepare for LoRA (Freezes weights, casts norms to fp32 for stability)
+        self.base_model = prepare_model_for_kbit_training(self.base_model)
 
-    def forward(self, idx, alpha=0.0):
-        device = idx.device
-        b, t = idx.size()
-        pos = torch.arange(0, t, dtype=torch.long, device=device)
-        
-        x = self.transformer.drop(self.transformer.wte(idx) + self.transformer.wpe(pos))
-        for block in self.transformer.h: x = block(x)
-        x = self.transformer.ln_f(x)
+        # 3. Add LoRA Adapters
+        print("Injecting LoRA Adapters...")
+        peft_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            inference_mode=False,
+            r=8,            # Rank
+            lora_alpha=32,  # Alpha
+            lora_dropout=0.05,
+            target_modules=["q_proj", "v_proj"] # Target Attention layers
+        )
+        self.base_model = get_peft_model(self.base_model, peft_config)
+        self.base_model.print_trainable_parameters()
 
-        token_logits = self.token_head(x)
-        idea_logits = self.idea_head_mlp(x)
+        # 4. Initialize The Idea Head (System 2)
+        # Mistral-7B hidden size is 4096
+        hidden_size = self.base_model.config.hidden_size
+        vocab_size = self.base_model.config.vocab_size
         
-        # GATING MECHANISM
-        idea_probs = torch.sigmoid(idea_logits)
-        # Clamping to prevent -inf penalties
-        gating_term = torch.clamp(torch.log(idea_probs + 1e-8), min=-2.0)
-        final_logits = token_logits + (alpha * gating_term)
+        print(f"Initializing Idea Head ({hidden_size} -> {vocab_size})...")
         
+        self.idea_head = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, vocab_size)
+        ).to(self.device)
+        
+        # FORCE Idea Head to BFloat16 to match LoRA dtype
+        self.idea_head = self.idea_head.to(dtype=torch.bfloat16)
+
+    def forward(self, input_ids, alpha=0.0):
+        # 1. Forward pass through Base Model (Mistral + LoRA)
+        # We need hidden_states to feed the Idea Head
+        outputs = self.base_model(
+            input_ids=input_ids,
+            output_hidden_states=True,
+            return_dict=True
+        )
+        
+        # Token Logits (Syntactic Stream) - Shape: [B, T, V]
+        # These come out in the compute_dtype (bfloat16) usually
+        token_logits = outputs.logits
+        
+        # Hidden States for Idea Head
+        # Mistral/Llama hidden_states[-1] is the state BEFORE the final LM Head
+        last_hidden_state = outputs.hidden_states[-1]
+        
+        # 2. Forward pass through Idea Head (Semantic Stream)
+        # last_hidden_state is bfloat16, idea_head is bfloat16 -> OK
+        idea_logits = self.idea_head(last_hidden_state)
+        
+        # 3. Gating Logic (The Paper's Mechanism)
+        if alpha > 0:
+            # Sigmoid to get probability of future concepts
+            p_idea = torch.sigmoid(idea_logits)
+            
+            # Log-Space Gating (Eq 4)
+            epsilon = 1e-8
+            gate = alpha * torch.log(p_idea + epsilon)
+            
+            # Clamp (Eq 5)
+            # Ensure tensor is on correct device and dtype
+            clamp_val = torch.tensor(self.beta_clamp, device=self.device, dtype=gate.dtype)
+            gate_clamped = torch.max(gate, clamp_val)
+            
+            # Apply to Token Logits (Eq 6)
+            final_logits = token_logits + gate_clamped
+        else:
+            final_logits = token_logits
+            
         return final_logits, idea_logits
