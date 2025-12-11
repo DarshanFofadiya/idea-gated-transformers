@@ -1,196 +1,247 @@
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-import math
-import time
-import json
+from torch.utils.data import DataLoader
+from transformers import AutoTokenizer
+import wandb
 import os
-import gc
-import argparse
-import numpy as np
+import shutil
+import math
 from tqdm import tqdm
-from transformers import GPT2Tokenizer
-from datasets import load_dataset
-import logging
-from model import StandardTransformer, IdeaGatedTransformer
 
-# ---------------------------------------------------------
-# 1. SETUP & HELPERS
-# ---------------------------------------------------------
-logging.getLogger("transformers").setLevel(logging.ERROR)
-logging.getLogger("datasets").setLevel(logging.ERROR)
+from model import IdeaGatedModel
+from data import StreamDataset, create_idea_target
 
-def free_gpu_memory():
-    gc.collect()
-    torch.cuda.empty_cache()
+import json
 
-def get_lr(it, config):
-    # Cosine Decay with Warmup
-    if it < config['warmup_iters']:
-        return config['learning_rate'] * it / config['warmup_iters']
-    if it > config['max_iters']:
-        return config['min_lr']
-    decay_ratio = (it - config['warmup_iters']) / (config['max_iters'] - config['warmup_iters'])
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-    return config['min_lr'] + coeff * (config['learning_rate'] - config['min_lr'])
+def log_to_text_file(log_dict, output_dir):
+    # Saves logs to a human-readable text file
+    file_path = os.path.join(output_dir, "training_log.jsonl")
+    with open(file_path, "a") as f:
+        f.write(json.dumps(log_dict) + "\n")
 
-def get_batch(split_data, config, batch_size):
-    ix = torch.randint(len(split_data) - config['block_size'] - config['idea_window_size'] - 1, (batch_size,))
-    x = torch.stack([torch.from_numpy((split_data[i:i+config['block_size']]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((split_data[i+1:i+1+config['block_size']]).astype(np.int64)) for i in ix])
+# --- CONFIGURATION ---
+CONF = {
+    "model_name": "mistralai/Mistral-7B-v0.1",
+    "block_size": 512,
+    "batch_size": 4,          # Physical batch size
+    "grad_accum": 8,          # Effective batch size = 32
+    "max_steps": 5000,        # Total training steps
+    "eval_steps": 200,        # Run validation every N steps
+    "save_steps": 1000,       # Save checkpoint every N steps
+    "lr": 2e-4,
+    "run_name": "idea_gated_mistral_v1",
+    "output_dir": "./experiments",
+    "val_batches": 50,        # How many batches to check during validation
     
-    # Raw future for Idea Head (only needed for Gated model, but safe to generate always)
-    raw_future = torch.stack([torch.from_numpy((split_data[i+1 : i+1+config['block_size']+config['idea_window_size']]).astype(np.int64)) for i in ix])
-    
-    return x.to(config['device']), y.to(config['device']), raw_future.to(config['device'])
+    # Early Stopping Config
+    "patience": 10,            # Stop after N evals with no improvement
+    "min_delta": 0.001,       # Minimum improvement required to reset counter
+}
 
-def create_multi_hot_target(raw_future, config):
-    B = raw_future.size(0)
-    targets = torch.zeros((B, config['block_size'], config['vocab_size']), device=config['device'], dtype=torch.float16)
-    for t in range(config['block_size']):
-        window = raw_future[:, t : t + config['idea_window_size']]
-        targets[:, t, :].scatter_(1, window, 1.0)
-    return targets
+class EarlyStopping:
+    def __init__(self, patience=5, min_delta=0.0):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.best_loss = float('inf')
+        self.early_stop = False
 
-# ---------------------------------------------------------
-# 2. MAIN TRAINER
-# ---------------------------------------------------------
-def train(args):
-    # --- Config ---
-    config = {
-        'vocab_size': 50257,
-        'n_layer': 6, 'n_head': 6, 'n_embd': 384,
-        'block_size': 256, 'dropout': 0.1,
-        'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-        'idea_window_size': 20,
-        'alpha_max': 0.5,
-        'micro_batch_size': 8,
-        'accum_steps': 4,  # Effective Batch Size = 32
-        'learning_rate': 3e-4, 'min_lr': 3e-5,
-        'max_iters': 50000,
-        'warmup_iters': 1000,
-        'eval_interval': 1000,
-        'save_interval': 5000,
-        'alpha_ramp_steps': 2000.0
-    }
-    
-    os.makedirs(args.output_dir, exist_ok=True)
-    print(f"Training {args.model_type} model on {config['device']}...")
-    
-    # --- Data Loading ---
-    print("Loading WikiText-103...")
-    dataset = load_dataset("wikitext", "wikitext-103-raw-v1")
-    enc = GPT2Tokenizer.from_pretrained("gpt2")
-    if enc.pad_token is None: enc.pad_token = enc.eos_token
-    
-    # Stopword Mask
-    idea_mask = torch.ones(config['vocab_size'], device=config['device'])
-    stopwords = [" the", " The", " and", " to", " of", " a", " in", " is", ".", ",", ":", ";", "?", "!", "-", "'", "\"", "\n"]
-    for w in stopwords: idea_mask[enc.encode(w)] = 0.0
+    def __call__(self, val_loss):
+        """
+        Returns True if we should save the model (improvement found).
+        Sets self.early_stop to True if patience is exceeded.
+        """
+        if val_loss < self.best_loss - self.min_delta:
+            self.best_loss = val_loss
+            self.counter = 0
+            return True # Improvement found
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+            return False # No significant improvement
 
-    def batch_tokenize(text_list):
-        ids = []
-        for i in tqdm(range(0, len(text_list), 1000), desc="Tokenizing"):
-            batch = "\n".join(text_list[i:i+1000])
-            if batch: ids.extend(enc.encode(batch))
-        return np.array(ids, dtype=np.uint16)
+def save_checkpoint(model, output_dir, step, is_best=False):
+    """Saves the adapter and idea head separately."""
+    path = os.path.join(output_dir, "best_model" if is_best else f"checkpoint_{step}")
+    os.makedirs(path, exist_ok=True)
+    
+    print(f"\nSaving model to {path}...")
+    # 1. Save LoRA Adapters
+    model.base_model.save_pretrained(path)
+    # 2. Save Idea Head
+    torch.save(model.idea_head.state_dict(), os.path.join(path, "idea_head.pt"))
+    # 3. Save training state (optional but good for resuming)
+    with open(os.path.join(path, "step_info.txt"), "w") as f:
+        f.write(str(step))
 
-    train_data = batch_tokenize(dataset['train']['text'])
-    val_data = batch_tokenize(dataset['validation']['text'])
-    print(f"Train Tokens: {len(train_data):,}")
+def evaluate(model, val_loader, device, num_batches=50):
+    """Runs a validation loop."""
+    model.eval()
+    total_loss = 0
+    total_token_loss = 0
+    total_idea_loss = 0
     
-    # --- Model Setup ---
-    if args.model_type == 'gated':
-        model = IdeaGatedTransformer(config).to(config['device'])
-    else:
-        model = StandardTransformer(config).to(config['device'])
-        
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config['learning_rate'])
-    pos_weight = torch.tensor([5.0], device=config['device']) # For Idea Head recall
-    
-    metrics = {"val_loss": [], "train_loss": []}
-    
-    # --- Loop ---
-    pbar = tqdm(range(config['max_iters']))
-    
-    for step in pbar:
-        
-        # LR Schedule
-        lr = get_lr(step, config)
-        for param_group in optimizer.param_groups: param_group['lr'] = lr
-        
-        # Evaluation
-        if step % config['eval_interval'] == 0:
-            model.eval()
-            losses = []
-            for _ in range(5):
-                x, y, _ = get_batch(val_data, config, config['micro_batch_size'])
-                with torch.no_grad():
-                    if args.model_type == 'gated':
-                        logits, _ = model(x, alpha=0.5) # Test with active gating
-                    else:
-                        logits = model(x)
-                    loss = F.cross_entropy(logits.view(-1, config['vocab_size']), y.view(-1))
-                losses.append(loss.item())
-            val_loss = sum(losses)/len(losses)
-            metrics['val_loss'].append(val_loss)
-            # Save metrics
-            with open(os.path.join(args.output_dir, 'metrics.json'), 'w') as f:
-                json.dump(metrics, f)
+    print("\nRunning Validation...")
+    with torch.no_grad():
+        for i, batch in enumerate(tqdm(val_loader, total=num_batches, desc="Validating")):
+            if i >= num_batches: break
             
-            tqdm.write(f"\n[Step {step}] Val Loss: {val_loss:.4f} | PPL: {math.exp(val_loss):.1f}")
-            model.train()
+            x, y, raw_future = batch
+            x, y = x.to(device), y.to(device)
+            raw_future = raw_future.to(device)
             
-        # Checkpointing
-        if step > 0 and step % config['save_interval'] == 0:
-            path = os.path.join(args.output_dir, f'checkpoint_{step}.pt')
-            torch.save(model.state_dict(), path)
-            
-        # Training Step (Accumulation)
-        optimizer.zero_grad()
-        total_loss_micro = 0
-        
-        curr_alpha = (step / config['alpha_ramp_steps']) * config['alpha_max']
-        alpha = min(config['alpha_max'], curr_alpha)
-        
-        for _ in range(config['accum_steps']):
-            x, y, raw_future = get_batch(train_data, config, config['micro_batch_size'])
-            
-            if args.model_type == 'gated':
-                logits_final, logits_idea = model(x, alpha=alpha)
-                loss_token = F.cross_entropy(logits_final.view(-1, config['vocab_size']), y.view(-1))
+            # Use max alpha (0.5) for validation to test the gating mechanism
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                final_logits, idea_logits = model(x, alpha=0.5)
                 
-                # Idea Loss
-                with torch.no_grad():
-                    y_idea = create_multi_hot_target(raw_future, config)
-                loss_idea_raw = F.binary_cross_entropy_with_logits(
-                    logits_idea, y_idea, reduction='none', pos_weight=pos_weight
+                loss_token = F.cross_entropy(
+                    final_logits.view(-1, final_logits.size(-1)), 
+                    y.view(-1)
                 )
-                loss_idea = (loss_idea_raw * idea_mask.unsqueeze(0).unsqueeze(0)).sum(dim=-1).mean()
                 
-                loss = loss_token + (0.01 * loss_idea)
-            else:
-                logits = model(x)
-                loss = F.cross_entropy(logits.view(-1, config['vocab_size']), y.view(-1))
+                y_idea = create_idea_target(raw_future, final_logits.size(-1), 20, device)
+                loss_idea = F.binary_cross_entropy_with_logits(idea_logits, y_idea)
                 
-            # Scale for accumulation
-            loss = loss / config['accum_steps']
-            loss.backward()
-            total_loss_micro += loss.item()
+                loss = loss_token + (0.1 * loss_idea)
             
-        optimizer.step()
-        
-        if step % 50 == 0:
-            pbar.set_description(f"L:{total_loss_micro * config['accum_steps']:.2f}")
+            total_loss += loss.item()
+            total_token_loss += loss_token.item()
+            total_idea_loss += loss_idea.item()
+            
+    model.train()
+    return total_loss / num_batches, total_token_loss / num_batches
 
-    # Final Save
-    torch.save(model.state_dict(), os.path.join(args.output_dir, 'model.pt'))
+def train():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    os.makedirs(CONF["output_dir"], exist_ok=True)
+    
+    # 1. Setup Tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(CONF["model_name"])
+    tokenizer.pad_token = tokenizer.eos_token
+
+    # 2. Setup Data
+    # Training stream starts at 0
+    train_dataset = StreamDataset(tokenizer, block_size=CONF["block_size"], skip_samples=0)
+    train_loader = DataLoader(train_dataset, batch_size=CONF["batch_size"], num_workers=0)
+    
+    # Validation stream skips first 200k samples to ensure no overlap
+    # (FineWeb-Edu samples are long, 200k is a safe buffer)
+    val_dataset = StreamDataset(tokenizer, block_size=CONF["block_size"], skip_samples=200_000)
+    val_loader = DataLoader(val_dataset, batch_size=CONF["batch_size"], num_workers=0)
+
+    # 3. Setup Model
+    model = IdeaGatedModel(CONF["model_name"], device).to(device)
+
+    # 4. Optimizer
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable_params, lr=CONF["lr"])
+    
+    print(f"Model initialized. Trainable Params: {sum(p.numel() for p in trainable_params):,}")
+    
+    # WandB
+    wandb.init(project="idea-gated-mistral", name=CONF["run_name"], config=CONF)
+
+    # Early Stopping Initialization
+    early_stopper = EarlyStopping(patience=CONF["patience"], min_delta=CONF["min_delta"])
+
+    # 5. Training Loop
+    model.train()
+    iter_loader = iter(train_loader)
+    
+    step = 0
+    
+    # Progress bar
+    pbar = tqdm(total=CONF["max_steps"], desc="Training")
+    
+    while step < CONF["max_steps"]:
+        optimizer.zero_grad()
+        accum_loss = 0
+        
+        # Alpha Schedule: Ramp to 0.5 over 1000 steps
+        alpha = min(0.5, (step / 1000) * 0.5)
+
+        for _ in range(CONF["grad_accum"]):
+            try:
+                x, y, raw_future = next(iter_loader)
+            except StopIteration:
+                iter_loader = iter(train_loader)
+                x, y, raw_future = next(iter_loader)
+            
+            x, y = x.to(device), y.to(device)
+            raw_future = raw_future.to(device)
+
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                final_logits, idea_logits = model(x, alpha=alpha)
+                
+                loss_token = F.cross_entropy(
+                    final_logits.view(-1, final_logits.size(-1)), 
+                    y.view(-1)
+                )
+
+                y_idea = create_idea_target(raw_future, final_logits.size(-1), 20, device)
+                loss_idea = F.binary_cross_entropy_with_logits(idea_logits, y_idea)
+                
+                loss = loss_token + (0.1 * loss_idea)
+                loss_scaled = loss / CONF["grad_accum"]
+            
+            loss_scaled.backward()
+            accum_loss += loss_scaled.item()
+        
+        # Clip Gradients
+        torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+        
+        optimizer.step()
+        step += 1
+        pbar.update(1)
+        
+        # Logging
+        if step % 10 == 0:
+
+            log_data = {
+                "step": step,
+                "train_loss": accum_loss,
+                "train_loss_token": loss_token.item(),
+                "train_loss_idea": loss_idea.item(),
+                "alpha": alpha
+            }
+
+            # 1. Log to WandB (Binary file)
+            wandb.log(log_data)
+
+            # 2. Log to Text File (Readable backup)
+            log_to_text_file(log_data, CONF["output_dir"]) 
+
+            pbar.set_postfix({"loss": f"{accum_loss:.3f}", "alpha": f"{alpha:.2f}"})
+            
+            
+        # Evaluation & Checkpointing & Early Stopping
+        if step % CONF["eval_steps"] == 0:
+            val_loss, val_token_loss = evaluate(model, val_loader, device, CONF["val_batches"])
+            print(f"Step {step} | Val Loss: {val_loss:.4f} | Early Stop Counter: {early_stopper.counter}/{early_stopper.patience}")
+            
+            wandb.log({
+                "val/loss": val_loss,
+                "val/loss_token": val_token_loss,
+                "val/perplexity": math.exp(val_token_loss) # PPL is exp(CE)
+            })
+            
+            # Check Early Stopping
+            is_improvement = early_stopper(val_loss)
+            
+            if is_improvement:
+                print(">>> Improvement found! Saving best model...")
+                save_checkpoint(model, CONF["output_dir"], step, is_best=True)
+            
+            if early_stopper.early_stop:
+                print(f"\n>>> Early Stopping Triggered at Step {step}. Val Loss ({val_loss:.4f}) did not improve for {CONF['patience']} checks.")
+                break
+
+        # Regular Checkpoint
+        if step % CONF["save_steps"] == 0:
+            save_checkpoint(model, CONF["output_dir"], step, is_best=False)
+
     print("Training Complete.")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--model_type', type=str, choices=['baseline', 'gated'], required=True)
-    parser.add_argument('--output_dir', type=str, required=True)
-    args = parser.parse_args()
-    
-    train(args)
+    train()
